@@ -1,78 +1,115 @@
 #include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
 #include <math.h>
 #include "vector.h"
 #include "config.h"
-#include <cuda_runtime.h>
-	
-__global__ void compute_Pairwise_Accelerations(vector3 *hPos, double *mass, vector3 *accels) {
+#include "planets.h"
+#include "compute.h"
 
-	int i = blockIdx.y * blockDim.y + threadIdx.y;
-	int j = blockIdx.x * blockDim.x + threadIdx.x;
+// represents the objects in the system.  Global variables
+vector3 *hVel, *d_hVel;
+vector3 *hPos, *d_hPos;
+double *mass;
 
-	if (i < NUMENTITIES && j < NUMENTITIES) {
-		if (i == j) {
-			FILL_VECTOR(accels[i * NUMENTITIES + j], 0, 0, 0);
-		} else {
-			vector3 distance;
-			for (int k = 0; k < 3; k++) {
-				distance[k] = hPos[i][k] - hPos[j][k];
-			}
-			double magnitude_sq = distance[0] * distance[0] + distance[1] * distance[1] + distance[2] * distance[2];
-			double magnitude = sqrt(magnitude_sq);
-			double accelmag = -1 * GRAV_CONSTANT * mass[j] / magnitude_sq;
-			FILL_VECTOR(accels[i * NUMENTITIES + j], accelmag * distance[0] / magnitude, accelmag * distance[1] / magnitude, accelmag * distance[2] / magnitude);
-		}
-	} 
+//initHostMemory: Create storage for numObjects entities in our system
+//Parameters: numObjects: number of objects to allocate
+//Returns: None
+//Side Effects: Allocates memory in the hVel, hPos, and mass global variables
+void initHostMemory(int numObjects)
+{
+	hVel = (vector3 *)malloc(sizeof(vector3) * numObjects);
+	hPos = (vector3 *)malloc(sizeof(vector3) * numObjects);
+	mass = (double *)malloc(sizeof(double) * numObjects);
 }
 
+//freeHostMemory: Free storage allocated by a previous call to initHostMemory
+//Parameters: None
+//Returns: None
+//Side Effects: Frees the memory allocated to global variables hVel, hPos, and mass.
+void freeHostMemory()
+{
+	free(hVel);
+	free(hPos);
+	free(mass);
+}
 
-__global__ void sum_and_update_velocity_and_position(vector3* hPos, vector3* hVel, vector3* accels, int numEntities) {
-
-	int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-	if (i < numEntities) {
-		vector3 accel_sum={0, 0, 0};
-		for (int j = 0; j < numEntities; j++){
-			for (int k = 0;k < 3; k++) {
-				accel_sum[k] += accels[i * numEntities + j][k];
-			}
+//planetFill: Fill the first NUMPLANETS+1 entries of the entity arrays with an estimation
+//				of our solar system (Sun+NUMPLANETS)
+//Parameters: None
+//Returns: None
+//Fills the first 8 entries of our system with an estimation of the sun plus our 8 planets.
+void planetFill(){
+	int i,j;
+	double data[][7]={SUN,MERCURY,VENUS,EARTH,MARS,JUPITER,SATURN,URANUS,NEPTUNE};
+	for (i=0;i<=NUMPLANETS;i++){
+		for (j=0;j<3;j++){
+			hPos[i][j]=data[i][j];
+			hVel[i][j]=data[i][j+3];
 		}
+		mass[i]=data[i][6];
+	}
+}
 
-		for (int k = 0; k < 3; k++){
-			hVel[i][k] += accel_sum[k] * INTERVAL;
-			hPos[i][k] = hVel[i][k] * INTERVAL;
+//randomFill: FIll the rest of the objects in the system randomly starting at some entry in the list
+//Parameters: 	start: The index of the first open entry in our system (after planetFill).
+//				count: The number of random objects to put into our system
+//Returns: None
+//Side Effects: Fills count entries in our system starting at index start (0 based)
+void randomFill(int start, int count)
+{
+	int i, j, c = start;
+	for (i = start; i < start + count; i++)
+	{
+		for (j = 0; j < 3; j++)
+		{
+			hVel[i][j] = (double)rand() / RAND_MAX * MAX_DISTANCE * 2 - MAX_DISTANCE;
+			hPos[i][j] = (double)rand() / RAND_MAX * MAX_VELOCITY * 2 - MAX_VELOCITY;
+			mass[i] = (double)rand() / RAND_MAX * MAX_MASS;
 		}
 	}
 }
 
-void compute(){
+//printSystem: Prints out the entire system to the supplied file
+//Parameters: 	handle: A handle to an open file with write access to prnt the data to
+//Returns: 		none
+//Side Effects: Modifies the file handle by writing to it.
+void printSystem(FILE* handle){
+	int i,j;
+	for (i=0;i<NUMENTITIES;i++){
+		fprintf(handle,"pos=(");
+		for (j=0;j<3;j++){
+			fprintf(handle,"%lf,",hPos[i][j]);
+		}
+		printf("),v=(");
+		for (j=0;j<3;j++){
+			fprintf(handle,"%lf,",hVel[i][j]);
+		}
+		fprintf(handle,"),m=%lf\n",mass[i]);
+	}
+}
 
-	vector3 *device_hPos, *device_hVel, *device_accels;
-	double *device_mass;
+int main(int argc, char **argv)
+{
+	clock_t t0=clock();
+	int t_now;
+	//srand(time(NULL));
+	srand(1234);
+	initHostMemory(NUMENTITIES);
+	planetFill();
+	randomFill(NUMPLANETS + 1, NUMASTEROIDS);
+	//now we have a system.
+	#ifdef DEBUG
+	printSystem(stdout);
+	#endif
+	for (t_now=0;t_now<DURATION;t_now+=INTERVAL){
+		compute();
+	}
+	clock_t t1=clock()-t0;
+#ifdef DEBUG
+	printSystem(stdout);
+#endif
+	printf("This took a total time of %f seconds\n",(double)t1/CLOCKS_PER_SEC);
 
-	cudaMalloc((void**)&device_hPos, sizeof(vector3)*NUMENTITIES);
-	cudaMalloc((void**)&device_hVel, sizeof(vector3)*NUMENTITIES);
-	cudaMalloc((void**)&device_mass, sizeof(double)*NUMENTITIES);
-	cudaMalloc((void**)&device_accels, sizeof(vector3)*NUMENTITIES*NUMENTITIES);
-
-	cudaMemcpy(device_hPos, hPos, sizeof(vector3)*NUMENTITIES, cudaMemcpyHostToDevice);
-	cudaMemcpy(device_hVel, hVel, sizeof(vector3)*NUMENTITIES, cudaMemcpyHostToDevice);
-	cudaMemcpy(device_mass, mass, sizeof(double)*NUMENTITIES, cudaMemcpyHostToDevice);
-
-	dim3 blockDim(16, 16);
-	dim3 gridDim((NUMENTITIES + blockDim.x - 1) / blockDim.x, (NUMENTITIES + blockDim.y - 1) / blockDim.y);
-
-	compute_Pairwise_Accelerations<<<gridDim, blockDim>>>(device_hPos, device_mass, device_accels);
-
-	cudaDeviceSynchronize();
-
-	sum_and_update_velocity_and_position<<<gridDim.x, blockDim.x>>>(device_hPos, device_hVel, device_accels, NUMENTITIES);
-
-	cudaMemcpy(hPos, device_hPos, sizeof(vector3)*NUMENTITIES, cudaMemcpyDeviceToHost);
-	cudaMemcpy(hVel, device_hVel, sizeof(vector3)*NUMENTITIES, cudaMemcpyDeviceToHost);
-
-	cudaFree(device_hPos);
-	cudaFree(device_hVel);
-	cudaFree(device_mass);
-	cudaFree(device_accels);
+	freeHostMemory();
 }
